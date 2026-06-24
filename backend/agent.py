@@ -15,6 +15,7 @@ If the agent loop errors out, qa.handle falls back to the deterministic router, 
 behaviour degrades gracefully.
 """
 import json
+import os
 
 import llm_client
 from vprs import describe_prereq, term_label
@@ -24,6 +25,15 @@ from diff import diff_plans
 import qa
 
 MAX_STEPS = 6  # observe/infer turns before we force a wrap-up
+
+# P4: the deterministic guardrails (auto-finalize, terminal correction) compensate
+# for a weak local model. They are LOAD-BEARING with the 9B model but cap how
+# agentic the loop can be. Make them measurable and switchable so their cost is
+# visible and a stronger model can run "trust mode" (guardrails off).
+#   ATLAS_GUARDRAILS=off    -> don't auto-finalize or override the model's terminal
+#   ATLAS_AGENT_DEBUG=1     -> attach an intervention trace to the response envelope
+_GUARDRAILS = os.environ.get("ATLAS_GUARDRAILS", "on").lower() != "off"
+_AGENT_DEBUG = os.environ.get("ATLAS_AGENT_DEBUG", "").lower() in ("1", "on", "true")
 
 
 # ---------------------------------------------------------------------------
@@ -276,6 +286,13 @@ class _Ctx:
             session["current_plan"] = base
         self.base = base
         self.last_sim = None  # most recent simulate result (dict from qa.simulate_change)
+        self.trace = []           # P4: scaffolding interventions this turn (observability)
+        self.corrections_left = 1  # P4: budget for nudging the model past a bad terminal
+
+    def note(self, event):
+        """Record a scaffolding intervention (auto-finalize, terminal correction,
+        tool error, self-correction) so its frequency is measurable."""
+        self.trace.append(event)
 
     # -- helpers --
     def _code(self, raw):
@@ -744,11 +761,15 @@ def _correct_terminal(name, ctx):
     """Upgrade a wrongly-picked terminal to the right one after a simulation. Small
     models reliably compute the right facts but routinely call respond instead of
     present_plan_change (or report_infeasible when relaxations are on offer). Leaves
-    ask_clarification alone."""
-    if ctx.last_sim is None:
+    ask_clarification alone. In trust mode (guardrails off) the model's choice
+    stands — so its raw reliability is observable."""
+    if ctx.last_sim is None or not _GUARDRAILS:
         return name
     if name in ("respond", "present_plan_change", "report_infeasible"):
-        return _terminal_for_sim(ctx.last_sim)
+        corrected = _terminal_for_sim(ctx.last_sim)
+        if corrected != name:
+            ctx.note(f"corrected_terminal:{name}->{corrected}")
+        return corrected
     return name
 
 
@@ -777,9 +798,21 @@ def _session_briefing(session):
 
 def run(prog, state, session, question):
     """Drive the tool loop. Returns the API response envelope. Raises on hard failure
-    (qa.handle catches and falls back to the deterministic router)."""
+    (qa.handle catches and falls back to the deterministic router). P4: optionally
+    attaches an intervention trace so the scaffolding's cost is observable."""
     ctx = _Ctx(prog, state, session)
-    system = _system_prompt(prog, state, ctx.prefs)
+    env = _agent_loop(ctx, _system_prompt(prog, state, ctx.prefs), session, question)
+    if _AGENT_DEBUG:
+        env.setdefault("debug", {})["interventions"] = ctx.trace
+    return env
+
+
+def _premature_terminal(name, ctx):
+    """True if the model picked a plan-outcome terminal before computing a plan."""
+    return name in ("present_plan_change", "offer_alternatives") and ctx.last_sim is None
+
+
+def _agent_loop(ctx, system, session, question):
     # Replay prior turns (plain user/assistant text) as conversation memory so the
     # agent can resolve references like "take it earlier" or "compare them". The
     # current turn's tool_use/tool_result messages stay local to this loop; only the
@@ -804,6 +837,19 @@ def run(prog, state, session, question):
         # terminal one and ignore the rest.
         display = next((t for t in tool_uses if t.name in _TERMINAL_TOOLS), None)
         if display is not None:
+            # P4: one bounded self-correction. If the model jumps to a plan terminal
+            # without having computed a plan (and didn't call replan this turn), nudge
+            # it once instead of silently degrading to an empty answer.
+            no_infer = not any(t.name in _PLAN_INFER_TOOLS for t in tool_uses)
+            if (_GUARDRAILS and no_infer and ctx.corrections_left > 0
+                    and _premature_terminal(display.name, ctx)):
+                ctx.corrections_left -= 1
+                ctx.note(f"self_correct:{display.name}")
+                messages.append({"role": "assistant", "content": resp.content})
+                messages.append({"role": "user", "content":
+                    f"You called {display.name} but no plan change has been computed. "
+                    f"Call replan first, or use respond for a plain answer."})
+                continue
             return ctx.finalize(_correct_terminal(display.name, ctx), display.input)
 
         # Otherwise run the observe/infer tools and feed results back.
@@ -811,15 +857,19 @@ def run(prog, state, session, question):
         results = []
         for t in tool_uses:
             out = ctx.dispatch(t.name, t.input)
+            if isinstance(out, dict) and out.get("error"):
+                ctx.note(f"tool_error:{t.name}")
             results.append({"type": "tool_result", "tool_use_id": t.id,
                             "content": json.dumps(out, ensure_ascii=False)})
             # Auto-finalize after plan-change infer tools so the model cannot
             # second-guess itself into another loop iteration. The terminal is chosen
-            # deterministically: present the plan, offer relaxations, or report
-            # infeasible — the model never has to get this right.
-            if t.name in _PLAN_INFER_TOOLS and ctx.last_sim is not None:
+            # deterministically. In trust mode (guardrails off) we skip this and let
+            # the model choose its own terminal next turn, so its reliability shows.
+            if (_GUARDRAILS and t.name in _PLAN_INFER_TOOLS
+                    and ctx.last_sim is not None):
                 messages.append({"role": "user", "content": results})
                 term = _terminal_for_sim(ctx.last_sim)
+                ctx.note(f"auto_finalize:{term}")
                 # Let offer_alternatives build its own rich message; otherwise pass the
                 # summary so the model's prose isn't needed.
                 args = {} if term == "offer_alternatives" else {
@@ -828,6 +878,7 @@ def run(prog, state, session, question):
         messages.append({"role": "user", "content": results})
 
     # Ran out of steps without a terminal tool -> force a grounded wrap-up.
+    ctx.note("wrapup_forced")
     messages.append({"role": "user",
                      "content": "Now call exactly one terminal tool to finish."})
     resp = llm_client.chat_tools(system, messages, TOOLS, max_tokens=1024,

@@ -25,6 +25,8 @@ from planner import plan_path, plan_credits, grad_term, relax
 from verifier import verify_plan
 import agent
 import qa
+import llm_client
+from llm_client import _Block, _Resp
 
 
 def _course_term(plan, code):
@@ -439,6 +441,118 @@ class MultiCandidateTests(unittest.TestCase):
         brief = agent._session_briefing(self.session)
         for c in self.session["candidates"]:
             self.assertIn(c["id"], brief)
+
+
+def _tool(name, inp, tid="t1"):
+    return _Block("tool_use", id=tid, name=name, input=inp)
+
+
+def _resp(*blocks):
+    return _Resp(list(blocks))
+
+
+class _ScriptedLLM:
+    """Returns pre-scripted responses for successive chat_tools calls, so the agent
+    loop can be driven deterministically without the real model."""
+    def __init__(self, *responses):
+        self.responses = list(responses)
+        self.i = 0
+
+    def __call__(self, system, messages, tools, max_tokens=2048, tool_choice=None):
+        r = self.responses[self.i]
+        self.i += 1
+        return r
+
+
+class ScaffoldingTests(unittest.TestCase):
+    """P4: the deterministic guardrails (auto-finalize, terminal correction) are now
+    observable (intervention trace) and switchable (trust mode), with one bounded
+    self-correction. Driven with a scripted LLM — no real model."""
+
+    def setUp(self):
+        self._g, self._d, self._ct = (agent._GUARDRAILS, agent._AGENT_DEBUG,
+                                      llm_client.chat_tools)
+        agent._AGENT_DEBUG = True
+
+    def tearDown(self):
+        agent._GUARDRAILS = self._g
+        agent._AGENT_DEBUG = self._d
+        llm_client.chat_tools = self._ct
+
+    def _run(self, *responses, guardrails=True, session=None):
+        agent._GUARDRAILS = guardrails
+        llm_client.chat_tools = _ScriptedLLM(*responses)
+        session = {} if session is None else session
+        return agent.run(PROGRAM, demo_state(), session, "hi"), session
+
+    def test_auto_finalize_records_and_presents(self):
+        env, sess = self._run(_resp(_tool("replan", {"graduate_later_by": 1})))
+        self.assertIsNotNone(env["candidate"])
+        self.assertEqual(len(sess["candidates"]), 1)
+        self.assertIn("auto_finalize:present_plan_change", env["debug"]["interventions"])
+
+    def test_trust_mode_skips_autofinalize_but_model_can_succeed(self):
+        env, _ = self._run(
+            _resp(_tool("replan", {"graduate_later_by": 1})),
+            _resp(_tool("present_plan_change", {"text": "ok"})),
+            guardrails=False)
+        self.assertIsNotNone(env["candidate"])
+        self.assertNotIn("auto_finalize:present_plan_change",
+                         env["debug"]["interventions"])
+
+    def test_trust_mode_surfaces_model_mistake(self):
+        # Model wrongly calls respond after a feasible replan; trust mode lets the
+        # mistake stand (no branch presented) so raw reliability is observable.
+        env, _ = self._run(
+            _resp(_tool("replan", {"graduate_later_by": 1})),
+            _resp(_tool("respond", {"text": "done"})),
+            guardrails=False)
+        self.assertIsNone(env["candidate"])
+
+    def test_self_correction_then_success(self):
+        env, _ = self._run(
+            _resp(_tool("present_plan_change", {"text": "x"})),   # premature
+            _resp(_tool("replan", {"graduate_later_by": 1})),     # corrected course
+            guardrails=True)
+        self.assertIsNotNone(env["candidate"])
+        tr = env["debug"]["interventions"]
+        self.assertIn("self_correct:present_plan_change", tr)
+        self.assertIn("auto_finalize:present_plan_change", tr)
+
+    def test_self_correction_is_bounded_to_once(self):
+        env, _ = self._run(
+            _resp(_tool("present_plan_change", {"text": "x"})),   # premature -> nudge
+            _resp(_tool("present_plan_change", {"text": "x"})),   # premature -> degrade
+            guardrails=True)
+        self.assertIsNone(env["candidate"])                       # degraded, not looping
+        tr = env["debug"]["interventions"]
+        self.assertEqual(sum(1 for e in tr if e.startswith("self_correct")), 1)
+
+    def test_tool_error_is_traced(self):
+        env, _ = self._run(
+            _resp(_tool("search_course", {"query": "zzzznotacourse"})),
+            _resp(_tool("respond", {"text": "nothing found"})),
+            guardrails=True)
+        self.assertIn("tool_error:search_course", env["debug"]["interventions"])
+
+    def test_correct_terminal_overrides_then_trust_mode_does_not(self):
+        ctx = agent._Ctx(PROGRAM, demo_state(), {})
+        ctx.last_sim = {"feasible": True}
+        agent._GUARDRAILS = True
+        self.assertEqual(agent._correct_terminal("respond", ctx), "present_plan_change")
+        self.assertIn("corrected_terminal:respond->present_plan_change", ctx.trace)
+        ctx2 = agent._Ctx(PROGRAM, demo_state(), {})
+        ctx2.last_sim = {"feasible": True}
+        agent._GUARDRAILS = False
+        self.assertEqual(agent._correct_terminal("respond", ctx2), "respond")
+        self.assertEqual(ctx2.trace, [])
+
+    def test_debug_trace_off_by_default(self):
+        agent._AGENT_DEBUG = False
+        llm_client.chat_tools = _ScriptedLLM(
+            _resp(_tool("replan", {"graduate_later_by": 1})))
+        env = agent.run(PROGRAM, demo_state(), {}, "hi")
+        self.assertNotIn("debug", env)
 
 
 if __name__ == "__main__":
