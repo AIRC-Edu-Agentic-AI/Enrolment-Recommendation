@@ -132,6 +132,17 @@
   .hint { padding: 0 16px 12px; }
   .hint button { font-family: var(--mono); font-size: 11px; color: var(--trunk); background: none; border: none; cursor: pointer; padding: 2px 0; display: block; text-align: left; }
   .hint button:hover { text-decoration: underline; }
+
+  /* drag-and-drop */
+  .card[draggable="true"] { cursor: grab; }
+  .card[draggable="true"]:active { cursor: grabbing; }
+  .card.dragging { opacity: 0.25; box-shadow: none; }
+  .term-col.drop-target {
+    background: rgba(59, 91, 219, 0.06);
+    border-radius: 8px;
+    outline: 2px dashed var(--trunk);
+    outline-offset: 3px;
+  }
 </style>
 </head>
 <body>
@@ -169,9 +180,13 @@ function setLLM(on) {
   document.getElementById("llmtxt").textContent = on ? "LM Studio online" : "LM Studio offline (fallback)";
 }
 
-function card(s, cls, mark, tag) {
+function card(s, cls, mark, tag, termNum) {
+  const canDrag = termNum != null && STATE && termNum >= STATE.current_term;
+  const dragAttrs = canDrag
+    ? ` draggable="true" data-code="${s.code}" data-term="${termNum}"`
+    : '';
   const passed = mark != null && mark >= 5.0;
-  let html = `<div class="card ${cls}">`;
+  let html = `<div class="card ${cls}"${dragAttrs}>`;
   if (tag) html += `<span class="tag ${tag}">${tag}</span>`;
   html += `<div class="code">${s.code}`;
   if (mark != null) html += `<span class="mark ${passed?'pass':'fail'}">${mark.toFixed(1)}</span>`;
@@ -180,8 +195,10 @@ function card(s, cls, mark, tag) {
   return html;
 }
 
-function termCol(label, credits, inner) {
-  return `<div class="term-col"><div class="term-head"><span>${label}</span>`
+function termCol(label, credits, inner, termNum, droppable) {
+  const canDrop = droppable && termNum != null && STATE && termNum >= STATE.current_term;
+  const dropAttr = canDrop ? ` data-drop-term="${termNum}"` : '';
+  return `<div class="term-col"${dropAttr}><div class="term-head"><span>${label}</span>`
        + `<span class="cr">${credits!=null?credits+' cr':''}</span></div>${inner}</div>`;
 }
 
@@ -194,67 +211,77 @@ function render() {
   // --- History lane (completed terms) ---
   html += `<div class="lane"><div class="lane-label"><span class="swatch" style="background:var(--passed)"></span>Completed</div><div class="timeline">`;
   STATE.history.forEach(t => {
-    const inner = t.subjects.map(s => card(s, s.passed?'passed':'failed', s.mark)).join("");
+    const inner = t.subjects.map(s => card(s, s.passed?'passed':'failed', s.mark, null, null)).join("");
     const cr = t.subjects.filter(s=>s.passed).reduce((a,s)=>a+s.credits,0);
-    html += termCol(STATE.term_labels[t.term], cr, inner);
+    html += termCol(STATE.term_labels[t.term], cr, inner, null, false);
   });
   html += `</div></div>`;
 
   // --- Plan lanes ---
   const plan = STATE.current_plan;
-  const cand = STATE.candidate;
-  const changeMap = buildChangeMap();   // code -> {tag, kind, from, to}
+  const cands = STATE.candidates || [];
+  // Ghost trunk courses that the most-recent branch moves/removes (visual cue).
+  const trunkMap = buildChangeMap(cands.length ? cands[cands.length-1].diff : null);
 
-  // Current plan lane
-  html += `<div class="lane"><div class="lane-label"><span class="swatch" style="background:var(--trunk)"></span>Current plan${cand?' (trunk)':''}</div><div class="timeline">`;
+  // Current plan lane (the trunk; the only droppable lane)
+  html += `<div class="lane"><div class="lane-label"><span class="swatch" style="background:var(--trunk)"></span>Current plan${cands.length?' (trunk)':''}</div><div class="timeline">`;
   plan.terms.forEach(t => {
     const inner = t.subjects.map(s => {
-      const ch = changeMap[s.code];
-      // in trunk: ghost a subject that moved away or was removed in candidate
-      let cls = "plan", tag = null;
-      if (cand && ch && (ch.kind==="removed" || (ch.kind==="moved" && ch.from===t.term))) cls += " ghost";
-      return card(s, cls, null, tag);
+      const ch = trunkMap[s.code];
+      let cls = "plan";
+      if (cands.length && ch && (ch.kind==="removed" || (ch.kind==="moved" && ch.from===t.term))) cls += " ghost";
+      return card(s, cls, null, null, t.term);
     }).join("");
-    html += termCol(STATE.term_labels[t.term], t.credits, inner);
+    html += termCol(STATE.term_labels[t.term], t.credits, inner, t.term, true);
   });
   html += `</div></div>`;
 
-  // Alternative lane (only when a candidate exists)
-  if (cand) {
-    const fork = DIFF ? DIFF.fork_term : null;
-    html += `<div class="lane"><div class="lane-label"><span class="swatch" style="background:var(--requested)"></span>Alternative `
-          + `<span class="swatch" style="background:var(--induced);margin-left:10px"></span><span style="color:var(--induced)">forced changes</span></div>`;
+  // One lane per pending candidate branch (P3: hold/compare/accept several).
+  cands.forEach(c => {
+    const cm = buildChangeMap(c.diff);
+    const fork = c.diff ? c.diff.fork_term : null;
+    const valid = !c.diff || c.diff.valid_b;
+    html += `<div class="lane"><div class="lane-label">`
+          + `<span class="swatch" style="background:var(--requested)"></span>`
+          + `<span class="cand-id">${c.id}</span> ${c.label || 'Alternative'}`
+          + `<span class="swatch" style="background:var(--induced);margin-left:10px"></span><span style="color:var(--induced)">forced changes</span>`
+          + (valid ? '' : ` <span style="color:var(--induced)">· ⚠ invalid</span>`) + `</div>`;
     if (fork) html += `<div class="fork-note">↳ branches at ${STATE.term_labels[fork]}</div>`;
     html += `<div class="timeline">`;
-    cand.terms.forEach(t => {
+    c.plan.terms.forEach(t => {
       const inner = t.subjects.map(s => {
-        const ch = changeMap[s.code];
+        const ch = cm[s.code];
         let cls = "plan", tag = null;
-        if (ch && (ch.kind==="added" || (ch.kind==="moved" && ch.to===t.term))) {
-          cls = ch.tag; tag = ch.tag;
-        }
-        return card(s, cls, null, tag);
+        if (ch && (ch.kind==="added" || (ch.kind==="moved" && ch.to===t.term))) { cls = ch.tag; tag = ch.tag; }
+        return card(s, cls, null, tag, t.term);
       }).join("");
-      html += termCol(STATE.term_labels[t.term], t.credits, inner);
+      html += termCol(STATE.term_labels[t.term], t.credits, inner, t.term, false);
     });
-    html += `</div></div>`;
-
-    html += `<div class="altbar"><span class="txt"><strong>Alternative plan ready.</strong> `
-          + `Graduates ${STATE.term_labels[cand.grad_term]}.</span>`
-          + `<button class="btn primary" onclick="accept()">Use this plan</button>`
-          + `<button class="btn" onclick="discard()">Discard</button></div>`;
-  }
+    html += `</div>`;
+    html += `<div class="altbar"><span class="txt"><strong>${c.id}.</strong> `
+          + `Graduates ${STATE.term_labels[c.plan.grad_term]} · peak ${c.peak} cr.</span>`
+          + `<button class="btn primary" onclick="accept('${c.id}')">Use this</button>`
+          + `<button class="btn" onclick="compareCand('${c.id}')">Compare</button>`
+          + `<button class="btn" onclick="discard('${c.id}')">Discard</button></div>`;
+    html += `</div>`;
+  });
 
   b.innerHTML = html;
 }
 
-function buildChangeMap() {
+function buildChangeMap(diff) {
   const m = {};
-  if (!DIFF) return m;
-  (DIFF.added||[]).forEach(x => m[x.code] = {tag:x.tag, kind:"added", to:x.term});
-  (DIFF.removed||[]).forEach(x => m[x.code] = {tag:x.tag, kind:"removed", from:x.term});
-  (DIFF.moved||[]).forEach(x => m[x.code] = {tag:x.tag, kind:"moved", from:x.from, to:x.to});
+  if (!diff) return m;
+  (diff.added||[]).forEach(x => m[x.code] = {tag:x.tag, kind:"added", to:x.term});
+  (diff.removed||[]).forEach(x => m[x.code] = {tag:x.tag, kind:"removed", from:x.term});
+  (diff.moved||[]).forEach(x => m[x.code] = {tag:x.tag, kind:"moved", from:x.from, to:x.to});
   return m;
+}
+
+function compareCand(id) {
+  const c = (STATE.candidates||[]).find(x => x.id===id);
+  if (!c) return;
+  DIFF = c.diff; renderCompare();
 }
 
 function renderCompare() {
@@ -296,21 +323,21 @@ async function send(text) {
   const resp = await r.json();
   addMsg(resp.text, "bot", resp.parse_source);
   if (resp.diff) {
-    DIFF = resp.diff;
-    await getState();        // refresh to pull candidate into STATE
+    DIFF = resp.diff;        // focus the comparison table on this change
+    await getState();        // refresh to pull candidates into STATE
     renderCompare();
-  } else if (resp.candidate === null && resp.intent !== "what_if") {
-    // non-plan answer; leave board as is
   }
 }
 
-async function accept() {
-  await fetch(API + "/api/accept", {method:"POST"});
+async function accept(id) {
+  await fetch(API + "/api/accept", {method:"POST",
+    headers:{"Content-Type":"application/json"}, body: JSON.stringify(id?{id}:{})});
   DIFF = null; document.getElementById("compare").innerHTML = "";
   await getState(); addMsg("Plan updated.", "bot");
 }
-async function discard() {
-  await fetch(API + "/api/discard", {method:"POST"});
+async function discard(id) {
+  await fetch(API + "/api/discard", {method:"POST",
+    headers:{"Content-Type":"application/json"}, body: JSON.stringify(id?{id}:{})});
   DIFF = null; document.getElementById("compare").innerHTML = "";
   await getState();
 }
@@ -332,6 +359,73 @@ document.getElementById("send").onclick = () => send();
 document.getElementById("input").addEventListener("keydown", e => { if (e.key==="Enter") send(); });
 renderHints();
 getState();
+
+// ---------------------------------------------------------------------------
+// Drag-and-drop rescheduling
+// ---------------------------------------------------------------------------
+(function () {
+  const board = document.getElementById("board");
+  let draggingEl = null;
+
+  board.addEventListener("dragstart", e => {
+    const c = e.target.closest("[draggable='true']");
+    if (!c) return;
+    draggingEl = c;
+    e.dataTransfer.effectAllowed = "move";
+    e.dataTransfer.setData("application/json", JSON.stringify({
+      code: c.dataset.code, fromTerm: parseInt(c.dataset.term)
+    }));
+    requestAnimationFrame(() => c.classList.add("dragging"));
+  });
+
+  board.addEventListener("dragend", () => {
+    if (draggingEl) { draggingEl.classList.remove("dragging"); draggingEl = null; }
+    board.querySelectorAll(".drop-target").forEach(el => el.classList.remove("drop-target"));
+  });
+
+  board.addEventListener("dragover", e => {
+    const col = e.target.closest("[data-drop-term]");
+    if (!col) return;
+    e.preventDefault();
+    e.dataTransfer.dropEffect = "move";
+    board.querySelectorAll(".drop-target").forEach(el => el.classList.remove("drop-target"));
+    col.classList.add("drop-target");
+  });
+
+  board.addEventListener("dragleave", e => {
+    const col = e.target.closest("[data-drop-term]");
+    if (col && !col.contains(e.relatedTarget)) col.classList.remove("drop-target");
+  });
+
+  board.addEventListener("drop", async e => {
+    e.preventDefault();
+    const col = e.target.closest("[data-drop-term]");
+    if (!col) return;
+    col.classList.remove("drop-target");
+    const toTerm = parseInt(col.dataset.dropTerm);
+    let data;
+    try { data = JSON.parse(e.dataTransfer.getData("application/json")); } catch { return; }
+    if (data.fromTerm === toTerm) return;
+    await dragReschedule(data.code, toTerm);
+  });
+})();
+
+async function dragReschedule(code, term) {
+  const r = await fetch(API + "/api/reschedule", {
+    method: "POST", headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({code, term})
+  });
+  const resp = await r.json();
+  if (!resp.ok) {
+    addMsg("Cannot reschedule: " + (resp.error || "infeasible."), "bot");
+    return;
+  }
+  addMsg(resp.text, "bot");
+  await getState();
+  // Focus the comparison on the branch this drag just created (the newest one).
+  const cands = STATE.candidates || [];
+  if (cands.length) { DIFF = cands[cands.length-1].diff; renderCompare(); }
+}
 </script>
 </body>
 </html>

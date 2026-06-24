@@ -135,7 +135,7 @@ def _chat_lmstudio(messages, temperature, max_tokens):
 # ---------------------------------------------------------------------------
 # Transport dispatch
 # ---------------------------------------------------------------------------
-def _chat(messages, temperature=0.0, max_tokens=400):
+def _chat(messages, temperature=0.0, max_tokens=1024):
     """Send an OpenAI-style message list to the configured backend. Raises on failure."""
     if PROVIDER == "anthropic":
         return _chat_anthropic(messages, temperature, max_tokens)
@@ -166,33 +166,166 @@ def llm_available(force=False):
 # ---------------------------------------------------------------------------
 # Tool use (agentic routing)
 # ---------------------------------------------------------------------------
-# Native tool calling is Anthropic-specific. The agent loop (agent.py) runs only
-# when this returns True; otherwise the deterministic router handles the turn.
+# Tool use (agentic routing)
+# ---------------------------------------------------------------------------
 def agent_available():
-    return PROVIDER == "anthropic" and llm_available()
+    return llm_available()
 
 
-def chat_tools(system, messages, tools, max_tokens=512, temperature=0.0,
-               tool_choice=None):
-    """One tool-use turn against Claude. Returns the raw Anthropic response object
-    (the caller inspects .content blocks and .stop_reason). Raises on failure."""
-    if PROVIDER != "anthropic":
-        raise RuntimeError("tool use requires the anthropic provider")
-    client = _get_anthropic()
-    if client is None:
-        raise RuntimeError("Anthropic client unavailable")
-    kwargs = dict(model=ANTHROPIC_MODEL, max_tokens=max_tokens,
-                  temperature=temperature, system=system,
-                  messages=messages, tools=tools)
+# Fake Anthropic SDK response objects so agent.py needs no changes.
+class _Block:
+    __slots__ = ("type", "text", "id", "name", "input")
+
+    def __init__(self, type, **kw):
+        self.type = type
+        self.text = kw.get("text", "")
+        self.id = kw.get("id")
+        self.name = kw.get("name")
+        self.input = kw.get("input")
+
+
+class _Resp:
+    __slots__ = ("content",)
+
+    def __init__(self, content):
+        self.content = content
+
+
+def _tools_to_openai(tools):
+    """Anthropic input_schema -> OpenAI function parameters."""
+    return [
+        {"type": "function",
+         "function": {
+             "name": t["name"],
+             "description": t.get("description", ""),
+             "parameters": t.get("input_schema", {"type": "object", "properties": {}}),
+         }}
+        for t in tools
+    ]
+
+
+def _messages_to_openai(system, messages):
+    """Convert Anthropic-format message list to OpenAI format.
+
+    Handles: plain string content, assistant blocks (text + tool_use),
+    and user tool-result lists. Works on both raw dicts and Anthropic SDK
+    objects (which agent.py stores back into the message list).
+    """
+    out = []
+    if system:
+        out.append({"role": "system", "content": system})
+    for m in messages:
+        role = m["role"]
+        content = m["content"]
+        if isinstance(content, str):
+            out.append({"role": role, "content": content})
+            continue
+        # list of blocks
+        if role == "user":
+            tool_results = [c for c in content
+                            if _block_type(c) == "tool_result"]
+            text_parts = [c for c in content
+                          if _block_type(c) == "text"]
+            if text_parts:
+                out.append({"role": "user",
+                            "content": "\n".join(_block_text(c) for c in text_parts)})
+            for tr in tool_results:
+                tid = tr["tool_use_id"] if isinstance(tr, dict) else tr.tool_use_id
+                body = tr["content"] if isinstance(tr, dict) else tr.content
+                if not isinstance(body, str):
+                    body = json.dumps(body, ensure_ascii=False)
+                out.append({"role": "tool", "tool_call_id": tid, "content": body})
+        elif role == "assistant":
+            text = "".join(_block_text(c) for c in content
+                           if _block_type(c) == "text")
+            tool_calls = []
+            for c in content:
+                if _block_type(c) == "tool_use":
+                    cid = c["id"] if isinstance(c, dict) else c.id
+                    name = c["name"] if isinstance(c, dict) else c.name
+                    inp = c["input"] if isinstance(c, dict) else c.input
+                    tool_calls.append({
+                        "id": cid, "type": "function",
+                        "function": {"name": name,
+                                     "arguments": json.dumps(inp, ensure_ascii=False)},
+                    })
+            msg = {"role": "assistant", "content": text or None}
+            if tool_calls:
+                msg["tool_calls"] = tool_calls
+            out.append(msg)
+    return out
+
+
+def _block_type(b):
+    return b.get("type") if isinstance(b, dict) else getattr(b, "type", None)
+
+
+def _block_text(b):
+    return b.get("text", "") if isinstance(b, dict) else getattr(b, "text", "")
+
+
+def _chat_tools_lmstudio(system, messages, tools, max_tokens, temperature, tool_choice):
+    """Tool-calling via OpenAI-compatible endpoint; returns a fake Anthropic response."""
+    body = {
+        "model": LM_MODEL,
+        "messages": _messages_to_openai(system, messages),
+        "tools": _tools_to_openai(tools),
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+        "stream": False,
+    }
     if tool_choice is not None:
-        kwargs["tool_choice"] = tool_choice
-    return client.messages.create(**kwargs)
+        tc_type = tool_choice.get("type")
+        body["tool_choice"] = "required" if tc_type == "any" else "auto"
+
+    r = _get_session().post(f"{LM_BASE}/chat/completions", json=body,
+                            timeout=(CONNECT_TIMEOUT, TIMEOUT))
+    r.raise_for_status()
+    msg = r.json()["choices"][0]["message"]
+
+    blocks = []
+    if msg.get("content"):
+        blocks.append(_Block("text", text=msg["content"]))
+    for tc in msg.get("tool_calls") or []:
+        fn = tc["function"]
+        try:
+            inp = json.loads(fn["arguments"])
+        except Exception:
+            inp = {}
+        blocks.append(_Block("tool_use", id=tc["id"], name=fn["name"], input=inp))
+    return _Resp(blocks)
+
+
+def chat_tools(system, messages, tools, max_tokens=2048, temperature=0.0,
+               tool_choice=None):
+    """One tool-use turn. Returns an Anthropic-compatible response object.
+    Works for both the Anthropic and LM Studio / OpenAI-compatible backends."""
+    if PROVIDER == "anthropic":
+        client = _get_anthropic()
+        if client is None:
+            raise RuntimeError("Anthropic client unavailable")
+        kwargs = dict(model=ANTHROPIC_MODEL, max_tokens=max_tokens,
+                      temperature=temperature, system=system,
+                      messages=messages, tools=tools)
+        if tool_choice is not None:
+            kwargs["tool_choice"] = tool_choice
+        return client.messages.create(**kwargs)
+    return _chat_tools_lmstudio(system, messages, tools, max_tokens,
+                                temperature, tool_choice)
 
 
 # ---------------------------------------------------------------------------
 # PARSE
 # ---------------------------------------------------------------------------
 _PARSE_SYS = """You convert a student's academic-advising question into a JSON query.
+Questions may be in English or Vietnamese. Common Vietnamese intent signals:
+- "sang kỳ", "vào kỳ", "dời sang", "chuyển sang", "học kỳ" -> what_if / pin
+- "trì hoãn", "dời lại", "đẩy lùi" -> what_if / delay
+- "học sớm", "càng sớm càng tốt" -> what_if / prefer_early
+- "bỏ", "xóa" -> what_if / drop
+- "có thể học", "đủ điều kiện" -> eligibility
+- "tại sao không", "vì sao không" -> why_not
+- "còn thiếu", "cần gì để tốt nghiệp" -> graduation_audit
 Output ONLY a JSON object, no prose, no markdown fences.
 
 Schema:
@@ -225,21 +358,21 @@ Use the provided course list to map names to codes. If none apply, subjects=[]."
 
 _PARSE_EXAMPLES = [
     ("What are the prerequisites for Machine Learning?",
-     '{"intent":"regulatory_lookup","subjects":["CS401"],"action":null}'),
-    ("Can I take Operating Systems now?",
-     '{"intent":"eligibility","subjects":["CS301"],"action":null}'),
-    ("Why can't I register for the capstone?",
-     '{"intent":"why_not","subjects":["CS410"],"action":null}'),
+     '{"intent":"regulatory_lookup","subjects":["UET.CS3136"],"action":null}'),
+    ("Can I take Artificial Intelligence now?",
+     '{"intent":"eligibility","subjects":["UET.CS2046"],"action":null}'),
+    ("Why can't I register for the Graduation Thesis?",
+     '{"intent":"why_not","subjects":["UET.CS4023"],"action":null}'),
     ("What should I take next term?",
      '{"intent":"recommend","subjects":[],"action":null}'),
-    ("I want to take Operating Systems this semester, what should I do?",
-     '{"intent":"what_if","subjects":["CS301"],"action":{"type":"pin","code":"CS301","term":null}}'),
+    ("I want to take Artificial Intelligence this semester, what should I do?",
+     '{"intent":"what_if","subjects":["UET.CS2046"],"action":{"type":"pin","code":"UET.CS2046","term":null}}'),
     ("Put Machine Learning in term 5",
-     '{"intent":"what_if","subjects":["CS401"],"action":{"type":"pin","code":"CS401","term":5}}'),
-    ("I want to delay Operating Systems",
-     '{"intent":"what_if","subjects":["CS301"],"action":{"type":"delay","code":"CS301","term":null}}'),
+     '{"intent":"what_if","subjects":["UET.CS3136"],"action":{"type":"pin","code":"UET.CS3136","term":5}}'),
+    ("I want to delay Artificial Intelligence",
+     '{"intent":"what_if","subjects":["UET.CS2046"],"action":{"type":"delay","code":"UET.CS2046","term":null}}'),
     ("Take Machine Learning as early as possible",
-     '{"intent":"what_if","subjects":["CS401"],"action":{"type":"prefer_early","code":"CS401","term":null}}'),
+     '{"intent":"what_if","subjects":["UET.CS3136"],"action":{"type":"prefer_early","code":"UET.CS3136","term":null}}'),
     ("Compare the two plans",
      '{"intent":"what_if","subjects":[],"action":null}'),
     ("What do I still need to graduate?",
@@ -265,7 +398,7 @@ def parse_question(question: str, subject_index: dict, current_term=None):
         msgs.append({"role": "assistant", "content": a})
     msgs.append({"role": "user", "content": question})
     try:
-        raw = _chat(msgs, max_tokens=200)
+        raw = _chat(msgs, max_tokens=1024)
         obj = _extract_json(raw)
         if obj and obj.get("intent") in INTENTS:
             obj.setdefault("subjects", [])
@@ -293,7 +426,7 @@ def _extract_json(text):
 
 def _fallback_parse(question, subject_index, current_term=None):
     q = question.lower()
-    # find subject codes and names
+    # find subject codes and names (full code match)
     found = []
     for c in subject_index:
         if c.lower() in q:
@@ -301,6 +434,12 @@ def _fallback_parse(question, subject_index, current_term=None):
     for c, n in subject_index.items():
         if n.lower() in q and c not in found:
             found.append(c)
+    # partial numeric-suffix match: "2046" -> "UET.CS2046"
+    if not found:
+        for c in subject_index:
+            suffix = re.sub(r'^[A-Za-z.]+', '', c)
+            if suffix and re.search(rf'\b{re.escape(suffix)}\b', q):
+                found.append(c)
     # distinctive-token match (e.g. "capstone" -> "Capstone Project")
     if not found:
         stop = {"to", "of", "and", "in", "i", "ii", "the", "for", "introduction"}
@@ -319,19 +458,23 @@ def _fallback_parse(question, subject_index, current_term=None):
         intent, action = "what_if", _mk_action("prefer_early", found)
     elif any(w in q for w in ["drop", "remove", "skip"]):
         intent, action = "what_if", _mk_action("drop", found)
-    elif found and any(w in q for w in ["this semester", "this term", "in term",
-                                        "next term", " now", "fit ", "schedule ", "put "]):
+    elif found and any(w in q for w in [
+            "this semester", "this term", "in term", "next term", " now",
+            "fit ", "schedule ", "put ",
+            "sang kỳ", "vào kỳ", "dời sang", "chuyển sang", "học kỳ"]):
         # "take X this semester / in term N / next term" -> pin to that term
         intent, action = "what_if", _mk_action("pin", found, _term_ref(q, current_term))
     elif any(w in q for w in ["compare", "difference", "versus", " vs "]):
         intent = "what_if"
-    elif any(w in q for w in ["can i take", "am i eligible", "eligible", "allowed to"]):
+    elif any(w in q for w in ["retake", "repeat", "can i take", "am i eligible",
+                               "eligible", "allowed to"]):
         intent = "eligibility"
     elif any(w in q for w in ["graduate", "left", "remaining", "still need"]):
         intent = "graduation_audit"
     elif any(w in q for w in ["recommend", "next term", "what should", "what do i take"]):
         intent = "recommend"
-    elif any(w in q for w in ["prerequisite", "prereq", "require", "requirement", "credits", "how many"]):
+    elif any(w in q for w in ["prerequisite", "prereq", "require", "requirement",
+                               "credits", "how many", "when is", "when can"]):
         intent = "regulatory_lookup"
     elif found:
         intent = "regulatory_lookup"
@@ -349,6 +492,11 @@ def _term_ref(q, current_term):
     m = re.search(r"term\s+(\d+)", q)
     if m:
         return int(m.group(1))
+    # "Y3 Fall" / "Y3 Spring" / "y3fall" etc.
+    m = re.search(r"y(\d+)\s*(fall|spring)", q, re.IGNORECASE)
+    if m:
+        year, season = int(m.group(1)), m.group(2).lower()
+        return (year - 1) * 2 + (1 if season == "fall" else 2)
     if current_term is not None and "next term" in q:
         return current_term + 1
     return None  # "this term"/"this semester"/"now" -> resolved downstream
@@ -370,7 +518,7 @@ def render(answer: dict) -> str:
     try:
         raw = _chat([{"role": "system", "content": _RENDER_SYS},
                      {"role": "user", "content": json.dumps(answer, ensure_ascii=False)}],
-                    max_tokens=180)
+                    max_tokens=768)
         out = raw.strip()
         if out:
             return out

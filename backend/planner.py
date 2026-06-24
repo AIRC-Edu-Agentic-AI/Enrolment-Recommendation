@@ -168,6 +168,13 @@ def _plan_cp(prog: Program, state, modifiers=None, anchor=None):
     drop = set(modifiers.get("drop", set()))
     prefer_early = set(modifiers.get("prefer_early", set()))
     not_before = modifiers.get("not_before", {})
+    # Parameterized constraints (all compose with whichever objective runs):
+    #   credit_cap     - per-term credit limit (override the program default)
+    #   max_grad_term  - graduate no later than this term (hard upper bound)
+    #   min_grad_term  - graduate no earlier than this term (for "graduate later")
+    credit_cap = int(modifiers.get("credit_cap") or prog.max_credits_per_term)
+    max_grad_term = modifiers.get("max_grad_term")
+    min_grad_term = modifiers.get("min_grad_term")
 
     passed = set(state.passed_marks().keys())
     t0, T = state.current_term, prog.horizon
@@ -222,9 +229,9 @@ def _plan_cp(prog: Program, state, modifiers=None, anchor=None):
         if c in pin:
             model.Add(x[c, pin[c]] == 1)
 
-    for t in terms:  # credit cap
+    for t in terms:  # credit cap (parameterized; defaults to the program limit)
         model.Add(sum(prog.subjects[c].credits * x[c, t] for c in sched)
-                  <= prog.max_credits_per_term)
+                  <= credit_cap)
 
     # Category credit minimums: passed credits + scheduled credits in each category
     # must reach the requirement. This is what makes the planner CHOOSE electives.
@@ -297,11 +304,42 @@ def _plan_cp(prog: Program, state, modifiers=None, anchor=None):
     earliness = sum(t * x[c, t] for c in sched for t in terms)
     early_pref = sum(t * x[c, t] for c in sched if c in prefer_early for t in terms)
 
-    if anchor:
+    # Hard graduation bounds (compose with every objective below).
+    # Upper bound: no course may be scheduled past max_grad_term (last is pushed up
+    # by scheduled terms, so bounding it bounds every course).
+    if max_grad_term is not None:
+        model.Add(last <= int(max_grad_term))
+    # Lower bound ("graduate no earlier than"): force at least one course at or after
+    # the bound. Bounding `last` directly is NOT enough — `last` is a free variable
+    # only pushed UP by scheduled terms, so with the objective minimizing it the
+    # solver would set last=bound while leaving every course earlier. Requiring a
+    # real course there is what genuinely pushes graduation later.
+    if min_grad_term is not None:
+        mg = int(min_grad_term)
+        model.Add(sum(x[c, t] for c in sched for t in terms if t >= mg) >= 1)
+
+    # --- objective selection -------------------------------------------------
+    # One knob. All the constraints above (pins, drops, credit cap, grad bounds)
+    # apply regardless; this only chooses what to optimize. Default: keep the
+    # baseline intact when re-solving from an anchor, else graduate as early as
+    # possible.
+    objective = modifiers.get("objective") or ("minimal_change" if anchor else "early")
+
+    if objective == "even":
+        # Spread credits as evenly as possible by minimizing the peak term load.
+        # Graduation MUST be bounded by the caller (max_grad_term); without it the
+        # solver would push courses across the whole horizon to drive the peak
+        # down. Tie-breakers: graduate early within the window, then front-load.
+        max_load = model.NewIntVar(0, credit_cap, "max_load")
+        for t in terms:
+            model.Add(sum(prog.subjects[c].credits * x[c, t]
+                          for c in sched) <= max_load)
+        model.Minimize(100000 * max_load + 100 * last + earliness)
+    elif objective == "minimal_change" and anchor:
         # What-if re-solve: keep as close to the baseline as possible so the diff
-        # shows only the requested change and its genuine forced consequences (not a
-        # fresh elective selection). deviation = (baseline courses that left their
-        # slot or were dropped) + (non-baseline courses newly added).
+        # shows only the requested change and its genuine forced consequences (not
+        # a fresh elective selection). deviation = (baseline courses that left
+        # their slot or were dropped) + (non-baseline courses newly added).
         anchor_term = {c: t for t, codes in anchor.items() for c in codes
                        if c in sched_set}
         # Courses the request is about are governed by their modifier, not anchored
@@ -317,14 +355,12 @@ def _plan_cp(prog: Program, state, modifiers=None, anchor=None):
                 dev.append(sum(x[c, t] for t in terms))   # penalize adding
         deviation = sum(dev)
         # Priority: (1) graduate as early as feasible, (2) minimal change from the
-        # baseline, (3) front-load. So a delay that fits keeps graduation on-time with
-        # the fewest shifts; a delay that doesn't fit pushes graduation later instead
-        # of churning the whole plan. The requested course is excluded from deviation
-        # above, so its own placement follows its modifier.
+        # baseline, (3) front-load.
         model.Minimize(100000 * last + 1000 * deviation + earliness)
     else:
-        # Fresh plan: minimize graduation term, then prefer_early, then front-load.
-        # Minimizing earliness also discourages taking electives beyond the minimum.
+        # Fresh plan ('early'): minimize graduation term, then prefer_early, then
+        # front-load. Minimizing earliness also discourages taking electives
+        # beyond the minimum.
         model.Minimize(10000 * last + 100 * early_pref + earliness)
 
     solver = cp_model.CpSolver()
@@ -355,3 +391,57 @@ def plan_credits(prog, plan):
 
 def grad_term(plan):
     return max(plan.keys()) if plan else None
+
+
+def relax(prog, state, base, modifiers, max_results=3):
+    """Turn an infeasible request into options. Given a constraint set the solver
+    could not satisfy, walk a small, prioritized ladder of SINGLE-constraint
+    relaxations and return those that become feasible, best (least-compromising)
+    first. Each result: {'description', 'modifiers', 'plan'}.
+
+    Deterministic and cheap (a handful of solves). This is what lets the advisor say
+    "can't do X as asked — but raising the cap to 21 / dropping that pin would work"
+    instead of dead-ending. The relaxations are chosen to preserve the student's goal:
+    e.g. for an over-tight EARLIER graduation we only offer heavier terms, never the
+    self-defeating "graduate later"."""
+    mods = modifiers or {}
+    base_grad = max(base.keys()) if base else prog.num_terms
+    cap = int(mods.get("credit_cap") or prog.max_credits_per_term)
+    wants_earlier = (mods.get("max_grad_term") is not None
+                     and int(mods["max_grad_term"]) < base_grad)
+
+    ladder = []  # (priority, description, relaxed_modifiers)
+    # 1) Raise the per-term credit cap (overload to fit) — the main enabler for a
+    #    tighter timeline. Try the smaller bump first so the least-overloaded plan wins.
+    for newcap in (21, 24):
+        if newcap > cap:
+            m = dict(mods); m["credit_cap"] = newcap
+            ladder.append((1, f"raise the per-term credit cap to {newcap}", m))
+    # 2) Allow graduating a little later than asked — only when a later deadline is
+    #    what's binding (NOT when the goal was to graduate earlier; that would defeat
+    #    the request).
+    if mods.get("max_grad_term") is not None and not wants_earlier:
+        for extra in (1, 2):
+            m = dict(mods); m["max_grad_term"] = int(mods["max_grad_term"]) + extra
+            ladder.append((2, f"allow graduating {extra} term(s) later than requested", m))
+    # 3) Relax an impossible pin: drop the pin requirement for each pinned course.
+    for c in (mods.get("pin") or {}):
+        m = dict(mods)
+        m["pin"] = {k: v for k, v in mods["pin"].items() if k != c}
+        if not m["pin"]:
+            del m["pin"]
+        nm = prog.subjects[c].name if c in prog.subjects else c
+        ladder.append((3, f"drop the request to pin {nm}", m))
+
+    results, seen = [], set()
+    for _prio, desc, m in sorted(ladder, key=lambda r: r[0]):
+        key = tuple(sorted((k, str(v)) for k, v in m.items()))
+        if key in seen:
+            continue
+        seen.add(key)
+        plan, reason = plan_path(prog, state, modifiers=m, anchor=base)
+        if not reason:
+            results.append({"description": desc, "modifiers": m, "plan": plan})
+        if len(results) >= max_results:
+            break
+    return results

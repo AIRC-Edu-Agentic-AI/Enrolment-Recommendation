@@ -28,11 +28,15 @@ def passed_set(state) -> set:
     return {c for c, m in state.passed_marks().items()}
 
 
-def verify_plan(prog: Program, state, plan: dict) -> list:
+def verify_plan(prog: Program, state, plan: dict, credit_cap: int = None) -> list:
     """
     plan: {term_index: [subject_code, ...]}  (future terms only)
+    credit_cap: per-term limit to enforce; defaults to prog.max_credits_per_term.
+                Pass a higher value when validating a plan that intentionally
+                overloads terms (e.g. "take more credits to graduate earlier").
     Returns list[Violation]. Empty list => valid.
     """
+    cap = credit_cap or prog.max_credits_per_term
     v = []
     names = prog.names()
     completed = passed_set(state)         # grows as we walk terms in order
@@ -76,10 +80,10 @@ def verify_plan(prog: Program, state, plan: dict) -> list:
 
         # credit cap for the term
         load = sum(prog.subjects[c].credits for c in codes if c in prog.subjects)
-        if load > prog.max_credits_per_term:
+        if load > cap:
             v.append(Violation("credit_cap",
                 f"{term_label(term)} is overloaded: {load} credits "
-                f"(max {prog.max_credits_per_term}).", None, term))
+                f"(max {cap}).", None, term))
 
         # commit this term
         for c in codes:

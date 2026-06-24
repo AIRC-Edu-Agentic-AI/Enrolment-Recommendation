@@ -18,8 +18,8 @@ MAX_HISTORY_TURNS = 6
 
 def handle(prog, state, session, question):
     """
-    session: mutable dict holding 'current_plan', 'candidate', 'candidate_requested',
-    and 'history' (a list of {role, content} turns — conversation memory).
+    session: mutable dict holding 'current_plan', 'candidates' (held alternative
+    branches), 'last_constraints', and 'history' (conversation memory).
     Returns a response dict for the API.
 
     When a tool-capable backend is available, an agent decides which tools to call
@@ -166,10 +166,10 @@ def _resolve_what_if(prog, state, session, q, question):
     if not action and subjects:
         action = {"type": "pin", "code": subjects[0], "term": state.current_term}
 
-    # no action and no subject -> compare existing candidate to current
+    # no action and no subject -> compare the latest pending candidate to current
     if not action:
-        cand = session.get("candidate")
-        if not cand:
+        rec = latest_candidate(session)
+        if not rec:
             ans = {"kind": "what_if",
                    "summary": "There's no alternative plan to compare yet. "
                               "Tell me a change to try, e.g. 'take Database Systems this "
@@ -178,12 +178,12 @@ def _resolve_what_if(prog, state, session, q, question):
             return {"text": llm_client.render(ans), "structured": ans,
                     "intent": "what_if", "parse_source": q.get("_source"),
                     "candidate": None, "diff": None}
-        d = diff_plans(prog, state, base, cand,
-                       set(session.get("candidate_requested", [])))
+        d = diff_plans(prog, state, base, rec["plan"],
+                       set(rec.get("requested") or []), credit_cap=rec.get("credit_cap"))
         ans = {"kind": "what_if", "summary": _summarize_diff(prog, d)}
         return {"text": llm_client.render(ans), "structured": ans,
                 "intent": "what_if", "parse_source": q.get("_source"),
-                "candidate": _plan_view(prog, cand), "diff": d}
+                "candidate": _plan_view(prog, rec["plan"]), "diff": d}
 
     sim = simulate_change(prog, state, base, action)
     if not sim["feasible"]:  # infeasible -> HITL, no fake branch
@@ -192,8 +192,9 @@ def _resolve_what_if(prog, state, session, q, question):
                 "intent": "what_if", "parse_source": q.get("_source"),
                 "candidate": None, "diff": None, "infeasible": True}
 
-    session["candidate"] = sim["candidate"]
-    session["candidate_requested"] = list(sim["requested"])
+    add_candidate(session, sim["candidate"], requested=sim["requested"],
+                  summary=sim["summary"],
+                  label=_auto_label(prog, state, sim["candidate"]))
     ans = {"kind": "what_if", "summary": sim["summary"]}
     return {"text": llm_client.render(ans), "structured": ans,
             "intent": "what_if", "parse_source": q.get("_source"),
@@ -286,3 +287,66 @@ def _plan_view(prog, plan):
             for t in sorted(plan.keys())],
         "grad_term": grad_term(plan),
     }
+
+
+# --- multi-candidate working state (P3) -------------------------------------
+# The session holds up to MAX_CANDIDATES alternative branches the student can hold,
+# compare, and accept individually — instead of a single overwrite-on-each-change slot.
+MAX_CANDIDATES = 3
+
+
+def _new_candidate_id(session):
+    n = session.get("_cand_seq", 0) + 1
+    session["_cand_seq"] = n
+    return f"c{n}"
+
+
+def add_candidate(session, plan, requested=None, credit_cap=None,
+                  constraints=None, label=None, summary=None):
+    """Append a candidate branch (FIFO-capped at MAX_CANDIDATES). Returns its id.
+    Also tracks the most-recent constraints for the cross-turn briefing (P1)."""
+    cands = session.setdefault("candidates", [])
+    cid = _new_candidate_id(session)
+    cands.append({"id": cid, "plan": plan, "requested": list(requested or []),
+                  "credit_cap": credit_cap, "constraints": constraints,
+                  "label": label, "summary": summary})
+    if len(cands) > MAX_CANDIDATES:
+        del cands[0]
+    if constraints:
+        session["last_constraints"] = constraints
+    return cid
+
+
+def get_candidate(session, cid):
+    return next((r for r in session.get("candidates", []) if r["id"] == cid), None)
+
+
+def latest_candidate(session):
+    cands = session.get("candidates", [])
+    return cands[-1] if cands else None
+
+
+def clear_candidates(session):
+    session["candidates"] = []
+    session["last_constraints"] = None
+
+
+def _auto_label(prog, state, plan):
+    g = grad_term(plan)
+    cr = plan_credits(prog, plan)
+    peak = max((v for t, v in cr.items() if t >= state.current_term), default=0)
+    return f"Graduate {term_label(g)} · peak {peak} cr" if g else "Alternative"
+
+
+def candidate_view(prog, state, base, rec):
+    """Serialize one candidate for the API: plan view + diff vs the current plan."""
+    plan = rec["plan"]
+    d = diff_plans(prog, state, base, plan, set(rec.get("requested") or []),
+                   credit_cap=rec.get("credit_cap"))
+    cr = plan_credits(prog, plan)
+    peak = max((v for t, v in cr.items() if t >= state.current_term), default=0)
+    return {"id": rec["id"],
+            "label": rec.get("label") or _auto_label(prog, state, plan),
+            "summary": rec.get("summary"),
+            "plan": _plan_view(prog, plan), "diff": d,
+            "grad_term": grad_term(plan), "peak": peak}

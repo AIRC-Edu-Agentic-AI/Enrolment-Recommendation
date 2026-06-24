@@ -17,8 +17,12 @@ def _flatten(plan):
     return {c: t for t, codes in plan.items() for c in codes}
 
 
-def diff_plans(prog: Program, state, plan_a: dict, plan_b: dict, requested: set):
-    """plan_a = baseline (current), plan_b = candidate. requested = explicitly named codes."""
+def diff_plans(prog: Program, state, plan_a: dict, plan_b: dict, requested: set,
+               credit_cap: int = None):
+    """plan_a = baseline (current), plan_b = candidate. requested = explicitly named codes.
+    credit_cap: per-term limit for validating the candidate (plan_b). Pass the
+    override when the candidate intentionally overloads terms, so a deliberate
+    overload is not reported as an invalid plan."""
     fa, fb = _flatten(plan_a), _flatten(plan_b)
     a_codes, b_codes = set(fa), set(fb)
 
@@ -47,7 +51,7 @@ def diff_plans(prog: Program, state, plan_a: dict, plan_b: dict, requested: set)
         load.append({"term": t, "a": ca.get(t, 0), "b": cb.get(t, 0)})
 
     va = [x.to_dict() for x in verify_plan(prog, state, plan_a)]
-    vb = [x.to_dict() for x in verify_plan(prog, state, plan_b)]
+    vb = [x.to_dict() for x in verify_plan(prog, state, plan_b, credit_cap=credit_cap)]
 
     ga, gb = grad_term(plan_a), grad_term(plan_b)
     grad_delta = (gb - ga) if (ga and gb) else None
