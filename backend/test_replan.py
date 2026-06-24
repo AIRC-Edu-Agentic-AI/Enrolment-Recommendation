@@ -123,6 +123,14 @@ class PlannerConstraintTests(unittest.TestCase):
         self.assertIsNone(reason)
         self.assertIsNone(_course_term(cand, elective))
 
+    def test_per_term_credit_cap_limits_one_term(self):
+        # "I can only do 15 credits in <current term>": that term is capped, others not.
+        t = self.cur
+        cand, reason = plan_path(self.prog, self.state,
+                                 modifiers={"term_credit_cap": {t: 15}}, anchor=self.base)
+        self.assertIsNone(reason)
+        self.assertLessEqual(plan_credits(self.prog, cand).get(t, 0), 15)
+
     def test_composition_pin_and_credit_cap(self):
         # The whole point of the redesign: two constraints in ONE solve, both honored.
         late_course = sorted(self.base[self.base_grad])[0]
@@ -239,6 +247,27 @@ class CtxReplanTests(unittest.TestCase):
         self.assertTrue(out["feasible"])
         cand = self.ctx.last_sim["candidate"]
         self.assertEqual(_course_term(cand, late_course), self.base_grad + 2)
+
+    def test_term_caps_via_label(self):
+        # "I can only do 15 credits in <current term>" -> that term is capped.
+        out = self.ctx.replan(term_caps=[{"term_label": term_label(self.cur),
+                                          "max_credits": 15}])
+        self.assertTrue(out["feasible"])
+        cand = self.ctx.last_sim["candidate"]
+        self.assertLessEqual(plan_credits(PROGRAM, cand).get(self.cur, 0), 15)
+
+    def test_term_cap_composes_with_even_and_later(self):
+        out = self.ctx.replan(
+            term_caps=[{"term_label": term_label(self.cur), "max_credits": 15}],
+            objective="even", graduate_later_by=1)
+        self.assertTrue(out["feasible"])
+        cand = self.ctx.last_sim["candidate"]
+        self.assertLessEqual(plan_credits(PROGRAM, cand).get(self.cur, 0), 15)
+
+    def test_term_cap_past_term_rejected(self):
+        out = self.ctx.replan(term_caps=[{"term_label": "Y1 Fall", "max_credits": 15}])
+        self.assertFalse(out["feasible"])
+        self.assertIn("passed", out["reason"])
 
     def test_system_prompt_renders(self):
         # The prompt is an f-string; literal {course:...} examples must be escaped or
@@ -453,12 +482,16 @@ def _resp(*blocks):
 
 class _ScriptedLLM:
     """Returns pre-scripted responses for successive chat_tools calls, so the agent
-    loop can be driven deterministically without the real model."""
+    loop can be driven deterministically without the real model. Records the messages
+    of the first call so tests can inspect what context was injected."""
     def __init__(self, *responses):
         self.responses = list(responses)
         self.i = 0
+        self.first_messages = None
 
     def __call__(self, system, messages, tools, max_tokens=2048, tool_choice=None):
+        if self.first_messages is None:
+            self.first_messages = messages
         r = self.responses[self.i]
         self.i += 1
         return r
@@ -553,6 +586,67 @@ class ScaffoldingTests(unittest.TestCase):
             _resp(_tool("replan", {"graduate_later_by": 1})))
         env = agent.run(PROGRAM, demo_state(), {}, "hi")
         self.assertNotIn("debug", env)
+
+
+class AblationFlagTests(unittest.TestCase):
+    """The substitution ablations (eval/POLICY.md): each hands a capability back to
+    the model rather than deleting it. Driven deterministically."""
+
+    def setUp(self):
+        self._g, self._b, self._r = agent._GUARDRAILS, agent._BRIEFING, agent._RELAX
+        self._d, self._ct, self._mc = agent._AGENT_DEBUG, llm_client.chat_tools, qa.MAX_CANDIDATES
+        agent._AGENT_DEBUG = True
+
+    def tearDown(self):
+        agent._GUARDRAILS, agent._BRIEFING, agent._RELAX = self._g, self._b, self._r
+        agent._AGENT_DEBUG, llm_client.chat_tools = self._d, self._ct
+        qa.MAX_CANDIDATES = self._mc
+
+    def _session_with_pending(self):
+        session = {}
+        ctx = agent._Ctx(PROGRAM, demo_state(), session)
+        ctx.replan(objective="even", graduate_later_by=2)
+        ctx.finalize("present_plan_change", {"text": ctx.last_sim.get("summary", "")})
+        return session
+
+    def test_briefing_on_injects_context(self):
+        agent._BRIEFING = True
+        session = self._session_with_pending()
+        llm = _ScriptedLLM(_resp(_tool("respond", {"text": "ok"})))
+        llm_client.chat_tools = llm
+        agent.run(PROGRAM, demo_state(), session, "make it a semester later")
+        last_user = llm.first_messages[-1]["content"]
+        self.assertIn("[Session context]", last_user)
+
+    def test_briefing_off_is_substitution_not_deletion(self):
+        # -memory: no structured briefing, but the raw transcript still reaches the model.
+        agent._BRIEFING = False
+        session = self._session_with_pending()
+        session.setdefault("history", []).append({"role": "user", "content": "earlier turn"})
+        llm = _ScriptedLLM(_resp(_tool("respond", {"text": "ok"})))
+        llm_client.chat_tools = llm
+        agent.run(PROGRAM, demo_state(), session, "make it a semester later")
+        joined = " ".join(str(m["content"]) for m in llm.first_messages)
+        self.assertNotIn("[Session context]", joined)   # structured state removed
+        self.assertIn("earlier turn", joined)            # raw transcript retained
+
+    def test_relax_off_passes_infeasibility_to_model(self):
+        # -relaxation: infeasible request yields no auto-offer; the model gets to react.
+        agent._RELAX = False
+        ctx = agent._Ctx(PROGRAM, demo_state(), {})
+        out = ctx.replan(graduate_earlier_by=1)
+        self.assertFalse(out["feasible"])
+        self.assertFalse(out.get("alternatives"))        # negotiate action unavailable
+
+    def test_max_candidates_one_overwrites(self):
+        # -multi-candidate: the held set collapses to a single overwrite slot.
+        qa.MAX_CANDIDATES = 1
+        session = {}
+        ctx = agent._Ctx(PROGRAM, demo_state(), session)
+        qa.add_candidate(session, ctx.base, label="a")
+        qa.add_candidate(session, ctx.base, label="b")
+        self.assertEqual(len(session["candidates"]), 1)
+        self.assertEqual(session["candidates"][0]["label"], "b")
 
 
 if __name__ == "__main__":

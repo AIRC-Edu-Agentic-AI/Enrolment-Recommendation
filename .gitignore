@@ -14,3 +14,9 @@ __pycache__/
 # OS / editor
 .DS_Store
 Thumbs.db
+
+# Eval run outputs (regenerable; large/churny)
+backend/eval/results.jsonl
+backend/eval/rq1_results.jsonl
+backend/eval/*_out.jsonl
+backend/eval/_sanity*.jsonl

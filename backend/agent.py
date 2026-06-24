@@ -32,8 +32,17 @@ MAX_STEPS = 6  # observe/infer turns before we force a wrap-up
 # visible and a stronger model can run "trust mode" (guardrails off).
 #   ATLAS_GUARDRAILS=off    -> don't auto-finalize or override the model's terminal
 #   ATLAS_AGENT_DEBUG=1     -> attach an intervention trace to the response envelope
+# The next two are SUBSTITUTION ablations for the policy study: they don't delete a
+# capability, they hand it back to the model so we measure whether the ENGINEERED
+# policy beats the model handling it ad hoc (see eval/POLICY.md).
+#   ATLAS_BRIEFING=off      -> no structured cross-turn state; model gets the raw
+#                              transcript only (tests whether STRUCTURING S_t helps)
+#   ATLAS_RELAX=off         -> no deterministic relaxation search; on infeasibility the
+#                              model is handed the reason and chooses its own next move
 _GUARDRAILS = os.environ.get("ATLAS_GUARDRAILS", "on").lower() != "off"
 _AGENT_DEBUG = os.environ.get("ATLAS_AGENT_DEBUG", "").lower() in ("1", "on", "true")
+_BRIEFING = os.environ.get("ATLAS_BRIEFING", "on").lower() != "off"
+_RELAX = os.environ.get("ATLAS_RELAX", "on").lower() != "off"
 
 
 # ---------------------------------------------------------------------------
@@ -148,11 +157,27 @@ TOOLS = [
                 },
                 "credit_cap": {
                     "type": "integer",
-                    "description": "Override the per-term credit limit (default 18). "
-                                   "Set this only when the student explicitly asks to "
-                                   "'take more credits' or names a cap. For 'graduate "
-                                   "earlier' use graduate_earlier_by instead and let the "
-                                   "system work out the cap.",
+                    "description": "Override the per-term credit limit for EVERY term "
+                                   "(default 18). Set this only when the student asks to "
+                                   "'take more credits' overall or names an all-term cap. "
+                                   "For 'graduate earlier' use graduate_earlier_by; for a "
+                                   "limit on ONE term use term_caps.",
+                },
+                "term_caps": {
+                    "type": "array",
+                    "description": "Per-term credit limits for SPECIFIC terms, e.g. 'I "
+                                   "can only do 15 credits in Y2 Spring' -> "
+                                   "[{term_label:'Y2 Spring', max_credits:15}]. Other "
+                                   "terms keep the normal limit.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "term_label": {"type": "string",
+                                           "description": "e.g. 'Y2 Spring'"},
+                            "max_credits": {"type": "integer"},
+                        },
+                        "required": ["term_label", "max_credits"],
+                    },
                 },
                 "graduate_earlier_by": {
                     "type": "integer",
@@ -288,6 +313,8 @@ class _Ctx:
         self.last_sim = None  # most recent simulate result (dict from qa.simulate_change)
         self.trace = []           # P4: scaffolding interventions this turn (observability)
         self.corrections_left = 1  # P4: budget for nudging the model past a bad terminal
+        self.tool_calls = []      # every (name, input) the model invoked (for eval/RQ2)
+        self.terminal = None      # the terminal action this turn finalized on
 
     def note(self, event):
         """Record a scaffolding intervention (auto-finalize, terminal correction,
@@ -390,16 +417,17 @@ class _Ctx:
 
     # -- infer --
     def replan(self, pin=None, earliest=None, delay=None, drop=None,
-               credit_cap=None, graduate_by=None, graduate_earlier_by=None,
-               graduate_later_by=None, graduate_no_earlier_than=None, objective=None):
+               credit_cap=None, term_caps=None, graduate_by=None,
+               graduate_earlier_by=None, graduate_later_by=None,
+               graduate_no_earlier_than=None, objective=None):
         """The single plan-change capability. Assemble the requested natural-language
         intent into a constraint set, solve once, and return the diff. Every
-        constraint composes — pins, delays, drops, credit cap, graduation bounds,
-        and objective can all be supplied together. If the request is infeasible,
-        search for minimal relaxations that would make it possible (P2)."""
+        constraint composes — pins, delays, drops, credit caps (global or per-term),
+        graduation bounds, and objective can all be supplied together. If the request
+        is infeasible, search for minimal relaxations that would make it possible (P2)."""
         mods, requested = self._build_constraints(
-            pin, earliest, delay, drop, credit_cap, graduate_by, graduate_earlier_by,
-            graduate_later_by, graduate_no_earlier_than, objective)
+            pin, earliest, delay, drop, credit_cap, term_caps, graduate_by,
+            graduate_earlier_by, graduate_later_by, graduate_no_earlier_than, objective)
         if "error" in mods:
             return {"feasible": False, "reason": mods["error"]}
 
@@ -407,7 +435,9 @@ class _Ctx:
                                  modifiers=mods, anchor=self.base)
         if reason:
             # Don't dead-end: look for minimal relaxations that make it feasible.
-            alts = self._find_alternatives(mods)
+            # (Substitution ablation: with ATLAS_RELAX=off this is skipped and the
+            # model is left to react to the infeasibility itself.)
+            alts = self._find_alternatives(mods) if _RELAX else []
             self.last_sim = {"feasible": False, "reason": reason, "alternatives": alts}
             out = {"feasible": False, "reason": reason}
             if alts:
@@ -465,9 +495,12 @@ class _Ctx:
             parts.append("earlier: " + ", ".join(sorted(mods["prefer_early"])))
         if mods.get("drop"):
             parts.append("dropped: " + ", ".join(sorted(mods["drop"])))
+        if mods.get("term_credit_cap"):
+            parts.append("term caps " + ", ".join(
+                f"{term_label(t)}<={c}cr" for t, c in mods["term_credit_cap"].items()))
         return "; ".join(parts) or "no special constraints"
 
-    def _build_constraints(self, pin, earliest, delay, drop, credit_cap,
+    def _build_constraints(self, pin, earliest, delay, drop, credit_cap, term_caps,
                            graduate_by, graduate_earlier_by, graduate_later_by,
                            graduate_no_earlier_than, objective):
         """Translate the tool's natural-language-shaped args into planner modifiers.
@@ -523,6 +556,20 @@ class _Ctx:
             if cap < 12:
                 return {"error": f"credit cap must be at least 12 (got {cap})"}, requested
             mods["credit_cap"] = cap
+
+        tcaps = {}
+        for item in term_caps or []:
+            t = self._parse_term_label(item.get("term_label"))
+            if t is None:
+                return {"error": f"unrecognized term '{item.get('term_label')}'"}, requested
+            mc = item.get("max_credits")
+            if mc is None:
+                return {"error": f"missing max_credits for {item.get('term_label')}"}, requested
+            if t < self.state.current_term:
+                return {"error": f"{item.get('term_label')} has already passed"}, requested
+            tcaps[t] = int(mc)
+        if tcaps:
+            mods["term_credit_cap"] = tcaps
 
         base_grad = max(self.base.keys()) if self.base else self.state.current_term
         gb = self._parse_term_label(graduate_by)
@@ -608,6 +655,7 @@ class _Ctx:
     # -- display (build the API envelope) --
     def finalize(self, name, args):
         text = (args.get("text") or "").strip()
+        self.terminal = name
         if name == "present_plan_change":
             sim = self.last_sim
             if not sim or not sim["feasible"]:
@@ -710,6 +758,9 @@ Answer the student's question by calling tools. Choose each step:
                                                     set a credit cap; if a heavier load is
                                                     needed the system offers it for you.
    - "take more credits / overwrite the cap"     → credit_cap: the number they gave (or 21)
+   - "I can only do 15 credits in Y2 Spring"     → term_caps: [{{term_label:"Y2 Spring",
+                                                    max_credits:15}}] (limits ONE term;
+                                                    use credit_cap only for an all-term limit)
    - "graduate one term later" / "one year later"→ graduate_later_by: 1 (a term/semester)
                                                     or 2 (a year)
    - "balance / even out / lighten the workload" → objective: "even" (add
@@ -803,7 +854,11 @@ def run(prog, state, session, question):
     ctx = _Ctx(prog, state, session)
     env = _agent_loop(ctx, _system_prompt(prog, state, ctx.prefs), session, question)
     if _AGENT_DEBUG:
-        env.setdefault("debug", {})["interventions"] = ctx.trace
+        env.setdefault("debug", {}).update({
+            "interventions": ctx.trace,
+            "tool_calls": ctx.tool_calls,
+            "terminal": ctx.terminal,
+        })
     return env
 
 
@@ -820,7 +875,8 @@ def _agent_loop(ctx, system, session, question):
     prior = list(session.get("history", []))
     # Prepend a structured working-state briefing to the current turn so pending
     # plan state survives across turns (the transcript only carries prose summaries).
-    brief = _session_briefing(session)
+    # Substitution ablation: ATLAS_BRIEFING=off leaves only the raw transcript.
+    brief = _session_briefing(session) if _BRIEFING else None
     user_content = f"{brief}\n\n{question}" if brief else question
     messages = prior + [{"role": "user", "content": user_content}]
 
@@ -856,6 +912,7 @@ def _agent_loop(ctx, system, session, question):
         messages.append({"role": "assistant", "content": resp.content})
         results = []
         for t in tool_uses:
+            ctx.tool_calls.append({"name": t.name, "input": t.input})
             out = ctx.dispatch(t.name, t.input)
             if isinstance(out, dict) and out.get("error"):
                 ctx.note(f"tool_error:{t.name}")
@@ -867,14 +924,19 @@ def _agent_loop(ctx, system, session, question):
             # the model choose its own terminal next turn, so its reliability shows.
             if (_GUARDRAILS and t.name in _PLAN_INFER_TOOLS
                     and ctx.last_sim is not None):
-                messages.append({"role": "user", "content": results})
-                term = _terminal_for_sim(ctx.last_sim)
-                ctx.note(f"auto_finalize:{term}")
-                # Let offer_alternatives build its own rich message; otherwise pass the
-                # summary so the model's prose isn't needed.
-                args = {} if term == "offer_alternatives" else {
-                    "text": ctx.last_sim.get("summary") or out.get("reason") or ""}
-                return ctx.finalize(term, args)
+                sim = ctx.last_sim
+                # Substitution ablation: with relaxation off, an infeasible result is
+                # NOT auto-reported — hand the reason back so the model picks the next
+                # move itself (the thing the engineered negotiate action would do).
+                if sim.get("feasible") or _RELAX:
+                    messages.append({"role": "user", "content": results})
+                    term = _terminal_for_sim(sim)
+                    ctx.note(f"auto_finalize:{term}")
+                    # offer_alternatives builds its own rich message; else pass summary.
+                    args = {} if term == "offer_alternatives" else {
+                        "text": sim.get("summary") or out.get("reason") or ""}
+                    return ctx.finalize(term, args)
+                ctx.note("relax_off_passthrough")
         messages.append({"role": "user", "content": results})
 
     # Ran out of steps without a terminal tool -> force a grounded wrap-up.

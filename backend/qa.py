@@ -3,6 +3,8 @@ QA router. Parse -> route to a deterministic resolver -> structured answer ->
 grounded render. What-if questions produce a candidate plan + a structured diff,
 which the frontend renders as a branch.
 """
+import os
+
 from vprs import describe_prereq, term_label, season_of
 from verifier import is_eligible, verify_plan
 from planner import plan_path, plan_credits, grad_term
@@ -292,7 +294,8 @@ def _plan_view(prog, plan):
 # --- multi-candidate working state (P3) -------------------------------------
 # The session holds up to MAX_CANDIDATES alternative branches the student can hold,
 # compare, and accept individually — instead of a single overwrite-on-each-change slot.
-MAX_CANDIDATES = 3
+# ATLAS_MAX_CANDIDATES=1 is the multi-candidate SUBSTITUTION ablation (overwrite).
+MAX_CANDIDATES = int(os.environ.get("ATLAS_MAX_CANDIDATES", "3"))
 
 
 def _new_candidate_id(session):

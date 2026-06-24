@@ -169,10 +169,14 @@ def _plan_cp(prog: Program, state, modifiers=None, anchor=None):
     prefer_early = set(modifiers.get("prefer_early", set()))
     not_before = modifiers.get("not_before", {})
     # Parameterized constraints (all compose with whichever objective runs):
-    #   credit_cap     - per-term credit limit (override the program default)
-    #   max_grad_term  - graduate no later than this term (hard upper bound)
-    #   min_grad_term  - graduate no earlier than this term (for "graduate later")
+    #   credit_cap       - default per-term credit limit (override the program default)
+    #   term_credit_cap  - {term: cap} overrides for specific terms (e.g. a lighter
+    #                      semester); falls back to credit_cap for unlisted terms
+    #   max_grad_term    - graduate no later than this term (hard upper bound)
+    #   min_grad_term    - graduate no earlier than this term (for "graduate later")
     credit_cap = int(modifiers.get("credit_cap") or prog.max_credits_per_term)
+    term_credit_cap = {int(t): int(c)
+                       for t, c in (modifiers.get("term_credit_cap") or {}).items()}
     max_grad_term = modifiers.get("max_grad_term")
     min_grad_term = modifiers.get("min_grad_term")
 
@@ -229,9 +233,9 @@ def _plan_cp(prog: Program, state, modifiers=None, anchor=None):
         if c in pin:
             model.Add(x[c, pin[c]] == 1)
 
-    for t in terms:  # credit cap (parameterized; defaults to the program limit)
-        model.Add(sum(prog.subjects[c].credits * x[c, t] for c in sched)
-                  <= credit_cap)
+    for t in terms:  # credit cap (per-term override, else the parameterized default)
+        cap_t = term_credit_cap.get(t, credit_cap)
+        model.Add(sum(prog.subjects[c].credits * x[c, t] for c in sched) <= cap_t)
 
     # Category credit minimums: passed credits + scheduled credits in each category
     # must reach the requirement. This is what makes the planner CHOOSE electives.
