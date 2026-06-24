@@ -1,0 +1,337 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ATLAS Course Advisor</title>
+<style>
+  :root {
+    --paper: #fbfaf7;
+    --ink: #1b1d2a;
+    --muted: #6b6e80;
+    --line: #e3e0d8;
+    --trunk: #3b5bdb;       /* current plan / structural */
+    --requested: #d98a0b;   /* what the student asked for */
+    --induced: #c2554d;     /* forced downstream change */
+    --passed: #2f7d5b;      /* completed & passed */
+    --failed: #b23b3b;
+    --chip: #f1efe8;
+    --mono: ui-monospace, "SF Mono", "Cascadia Mono", Menlo, Consolas, monospace;
+    --sans: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--paper); color: var(--ink);
+    font-family: var(--sans); font-size: 14px; line-height: 1.45;
+  }
+  header {
+    display: flex; align-items: baseline; gap: 16px; flex-wrap: wrap;
+    padding: 14px 22px; border-bottom: 1px solid var(--line); background: #fff;
+  }
+  header h1 { font-size: 16px; margin: 0; letter-spacing: -0.01em; }
+  header .prog { font-family: var(--mono); font-size: 12px; color: var(--muted); }
+  .pill {
+    margin-left: auto; font-family: var(--mono); font-size: 11px;
+    padding: 3px 9px; border-radius: 999px; border: 1px solid var(--line);
+    display: inline-flex; align-items: center; gap: 6px;
+  }
+  .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--muted); }
+  .dot.on { background: var(--passed); }
+  .dot.off { background: var(--failed); }
+
+  .layout { display: grid; grid-template-columns: 1fr 360px; gap: 0; height: calc(100vh - 53px); }
+  @media (max-width: 900px) { .layout { grid-template-columns: 1fr; height: auto; } }
+
+  .board { overflow: auto; padding: 20px 22px; }
+  .sidebar { border-left: 1px solid var(--line); background: #fff; display: flex; flex-direction: column; min-height: 0; }
+
+  .lane-label {
+    font-family: var(--mono); font-size: 11px; text-transform: uppercase;
+    letter-spacing: 0.08em; color: var(--muted); margin: 0 0 8px;
+    display: flex; align-items: center; gap: 8px;
+  }
+  .lane-label .swatch { width: 10px; height: 10px; border-radius: 2px; }
+
+  .timeline { display: flex; gap: 12px; align-items: stretch; min-width: max-content; }
+  .term-col { width: 168px; flex: 0 0 168px; }
+  .term-head {
+    font-family: var(--mono); font-size: 11px; color: var(--muted);
+    padding: 4px 2px 8px; border-bottom: 1px solid var(--line); margin-bottom: 8px;
+    display: flex; justify-content: space-between;
+  }
+  .term-head .cr { color: var(--ink); }
+
+  .card {
+    background: #fff; border: 1px solid var(--line); border-radius: 7px;
+    padding: 7px 9px; margin-bottom: 7px; position: relative;
+  }
+  .card .code { font-family: var(--mono); font-size: 12px; font-weight: 600; }
+  .card .nm { font-size: 12px; color: var(--muted); margin-top: 1px; }
+  .card .meta { font-family: var(--mono); font-size: 10px; color: var(--muted); margin-top: 4px; }
+  .card.passed { border-left: 3px solid var(--passed); }
+  .card.failed { border-left: 3px solid var(--failed); opacity: 0.85; }
+  .card.plan   { border-left: 3px solid var(--trunk); }
+  .card.requested { border: 1px solid var(--requested); box-shadow: 0 0 0 1px var(--requested); }
+  .card.induced   { border: 1px solid var(--induced); box-shadow: 0 0 0 1px var(--induced); }
+  .card.ghost { opacity: 0.4; text-decoration: line-through; }
+  .tag {
+    position: absolute; top: -7px; right: 7px; font-family: var(--mono);
+    font-size: 9px; text-transform: uppercase; letter-spacing: 0.05em;
+    padding: 1px 5px; border-radius: 3px; color: #fff;
+  }
+  .tag.requested { background: var(--requested); }
+  .tag.induced { background: var(--induced); }
+  .mark { float: right; font-family: var(--mono); font-weight: 600; }
+  .mark.pass { color: var(--passed); } .mark.fail { color: var(--failed); }
+
+  .now-divider {
+    flex: 0 0 1px; background: linear-gradient(var(--line), var(--line));
+    position: relative; margin: 0 6px;
+  }
+  .now-divider span {
+    position: absolute; top: 0; left: 50%; transform: translateX(-50%) rotate(0);
+    font-family: var(--mono); font-size: 9px; color: var(--muted);
+    writing-mode: vertical-rl; letter-spacing: 0.1em; padding-top: 28px;
+  }
+
+  .lane { margin-bottom: 26px; }
+  .fork-note {
+    font-family: var(--mono); font-size: 11px; color: var(--induced);
+    margin: 2px 0 10px;
+  }
+
+  .altbar {
+    display: flex; gap: 8px; align-items: center; margin: 0 0 12px;
+    padding: 8px 12px; background: #fff7ec; border: 1px solid #f0dcb8; border-radius: 7px;
+  }
+  .altbar .txt { font-size: 13px; }
+  .btn {
+    font-family: var(--sans); font-size: 12px; border: 1px solid var(--line);
+    background: #fff; padding: 5px 12px; border-radius: 6px; cursor: pointer;
+  }
+  .btn.primary { background: var(--trunk); color: #fff; border-color: var(--trunk); }
+  .btn:hover { filter: brightness(0.97); }
+
+  /* chat */
+  .chat { display: flex; flex-direction: column; min-height: 0; flex: 1; }
+  .chat .log { flex: 1; overflow-y: auto; padding: 16px; display: flex; flex-direction: column; gap: 10px; }
+  .msg { max-width: 92%; padding: 8px 11px; border-radius: 10px; font-size: 13px; }
+  .msg.user { align-self: flex-end; background: var(--trunk); color: #fff; border-bottom-right-radius: 3px; }
+  .msg.bot { align-self: flex-start; background: var(--chip); border-bottom-left-radius: 3px; }
+  .msg .src { font-family: var(--mono); font-size: 9px; opacity: 0.6; margin-top: 4px; }
+  .msg.bot .src.fallback { color: var(--induced); }
+  .compare { padding: 0 16px 12px; }
+  .compare table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  .compare th, .compare td { text-align: left; padding: 4px 6px; border-bottom: 1px solid var(--line); }
+  .compare th { font-family: var(--mono); font-size: 10px; text-transform: uppercase; color: var(--muted); }
+  .compare .req { color: var(--requested); font-weight: 600; }
+  .compare .ind { color: var(--induced); font-weight: 600; }
+  .compose { display: flex; gap: 8px; padding: 12px 16px; border-top: 1px solid var(--line); }
+  .compose input { flex: 1; padding: 9px 11px; border: 1px solid var(--line); border-radius: 7px; font-family: var(--sans); font-size: 13px; }
+  .compose input:focus { outline: 2px solid var(--trunk); outline-offset: -1px; }
+  .hint { padding: 0 16px 12px; }
+  .hint button { font-family: var(--mono); font-size: 11px; color: var(--trunk); background: none; border: none; cursor: pointer; padding: 2px 0; display: block; text-align: left; }
+  .hint button:hover { text-decoration: underline; }
+</style>
+</head>
+<body>
+<header>
+  <h1>ATLAS Course Advisor</h1>
+  <span class="prog" id="prog"></span>
+  <span class="pill" id="llmpill"><span class="dot" id="llmdot"></span><span id="llmtxt">checking model…</span></span>
+</header>
+
+<div class="layout">
+  <main class="board" id="board"></main>
+  <aside class="sidebar">
+    <div class="chat">
+      <div class="log" id="log"></div>
+      <div class="compare" id="compare"></div>
+      <div class="hint" id="hints"></div>
+      <div class="compose">
+        <input id="input" placeholder="Ask about a course, plan, or 'delay Operating Systems'…" autocomplete="off">
+        <button class="btn primary" id="send">Send</button>
+      </div>
+    </div>
+  </aside>
+</div>
+
+<script>
+const API = "";
+let STATE = null, DIFF = null;
+
+async function getState() {
+  const r = await fetch(API + "/api/state"); STATE = await r.json(); render();
+  setLLM(STATE.llm_online);
+}
+function setLLM(on) {
+  document.getElementById("llmdot").className = "dot " + (on ? "on" : "off");
+  document.getElementById("llmtxt").textContent = on ? "LM Studio online" : "LM Studio offline (fallback)";
+}
+
+function card(s, cls, mark, tag) {
+  const passed = mark != null && mark >= 5.0;
+  let html = `<div class="card ${cls}">`;
+  if (tag) html += `<span class="tag ${tag}">${tag}</span>`;
+  html += `<div class="code">${s.code}`;
+  if (mark != null) html += `<span class="mark ${passed?'pass':'fail'}">${mark.toFixed(1)}</span>`;
+  html += `</div><div class="nm">${s.name}</div>`;
+  html += `<div class="meta">${s.credits} cr · ${s.category}</div></div>`;
+  return html;
+}
+
+function termCol(label, credits, inner) {
+  return `<div class="term-col"><div class="term-head"><span>${label}</span>`
+       + `<span class="cr">${credits!=null?credits+' cr':''}</span></div>${inner}</div>`;
+}
+
+function render() {
+  const b = document.getElementById("board");
+  document.getElementById("prog").textContent = STATE.program + " · " + STATE.student;
+  const cur = STATE.current_term;
+  let html = "";
+
+  // --- History lane (completed terms) ---
+  html += `<div class="lane"><div class="lane-label"><span class="swatch" style="background:var(--passed)"></span>Completed</div><div class="timeline">`;
+  STATE.history.forEach(t => {
+    const inner = t.subjects.map(s => card(s, s.passed?'passed':'failed', s.mark)).join("");
+    const cr = t.subjects.filter(s=>s.passed).reduce((a,s)=>a+s.credits,0);
+    html += termCol(STATE.term_labels[t.term], cr, inner);
+  });
+  html += `</div></div>`;
+
+  // --- Plan lanes ---
+  const plan = STATE.current_plan;
+  const cand = STATE.candidate;
+  const changeMap = buildChangeMap();   // code -> {tag, kind, from, to}
+
+  // Current plan lane
+  html += `<div class="lane"><div class="lane-label"><span class="swatch" style="background:var(--trunk)"></span>Current plan${cand?' (trunk)':''}</div><div class="timeline">`;
+  plan.terms.forEach(t => {
+    const inner = t.subjects.map(s => {
+      const ch = changeMap[s.code];
+      // in trunk: ghost a subject that moved away or was removed in candidate
+      let cls = "plan", tag = null;
+      if (cand && ch && (ch.kind==="removed" || (ch.kind==="moved" && ch.from===t.term))) cls += " ghost";
+      return card(s, cls, null, tag);
+    }).join("");
+    html += termCol(STATE.term_labels[t.term], t.credits, inner);
+  });
+  html += `</div></div>`;
+
+  // Alternative lane (only when a candidate exists)
+  if (cand) {
+    const fork = DIFF ? DIFF.fork_term : null;
+    html += `<div class="lane"><div class="lane-label"><span class="swatch" style="background:var(--requested)"></span>Alternative `
+          + `<span class="swatch" style="background:var(--induced);margin-left:10px"></span><span style="color:var(--induced)">forced changes</span></div>`;
+    if (fork) html += `<div class="fork-note">↳ branches at ${STATE.term_labels[fork]}</div>`;
+    html += `<div class="timeline">`;
+    cand.terms.forEach(t => {
+      const inner = t.subjects.map(s => {
+        const ch = changeMap[s.code];
+        let cls = "plan", tag = null;
+        if (ch && (ch.kind==="added" || (ch.kind==="moved" && ch.to===t.term))) {
+          cls = ch.tag; tag = ch.tag;
+        }
+        return card(s, cls, null, tag);
+      }).join("");
+      html += termCol(STATE.term_labels[t.term], t.credits, inner);
+    });
+    html += `</div></div>`;
+
+    html += `<div class="altbar"><span class="txt"><strong>Alternative plan ready.</strong> `
+          + `Graduates ${STATE.term_labels[cand.grad_term]}.</span>`
+          + `<button class="btn primary" onclick="accept()">Use this plan</button>`
+          + `<button class="btn" onclick="discard()">Discard</button></div>`;
+  }
+
+  b.innerHTML = html;
+}
+
+function buildChangeMap() {
+  const m = {};
+  if (!DIFF) return m;
+  (DIFF.added||[]).forEach(x => m[x.code] = {tag:x.tag, kind:"added", to:x.term});
+  (DIFF.removed||[]).forEach(x => m[x.code] = {tag:x.tag, kind:"removed", from:x.term});
+  (DIFF.moved||[]).forEach(x => m[x.code] = {tag:x.tag, kind:"moved", from:x.from, to:x.to});
+  return m;
+}
+
+function renderCompare() {
+  const el = document.getElementById("compare");
+  if (!DIFF) { el.innerHTML = ""; return; }
+  const rows = [];
+  const fmt = c => `${c.code} <span class="${c.tag==='requested'?'req':'ind'}">${c.tag}</span>`;
+  (DIFF.moved||[]).forEach(c => rows.push([fmt(c), `${STATE.term_labels[c.from]} → ${STATE.term_labels[c.to]}`]));
+  (DIFF.added||[]).forEach(c => rows.push([fmt(c), `added in ${STATE.term_labels[c.term]}`]));
+  (DIFF.removed||[]).forEach(c => rows.push([fmt(c), `removed from ${STATE.term_labels[c.from]}`]));
+  let g = "graduation unchanged";
+  if (DIFF.grad_delta>0) g = `graduates ${DIFF.grad_delta} term(s) later`;
+  else if (DIFF.grad_delta<0) g = `graduates ${-DIFF.grad_delta} term(s) earlier`;
+  let html = `<div class="lane-label">Comparison · ${g}${DIFF.valid_b?'':' · ⚠ invalid'}</div>`;
+  html += `<table><thead><tr><th>change</th><th>detail</th></tr></thead><tbody>`;
+  if (!rows.length) html += `<tr><td colspan="2" style="color:var(--muted)">no structural changes</td></tr>`;
+  rows.forEach(r => html += `<tr><td>${r[0]}</td><td>${r[1]}</td></tr>`);
+  html += `</tbody></table>`;
+  el.innerHTML = html;
+}
+
+function addMsg(text, who, src) {
+  const log = document.getElementById("log");
+  const d = document.createElement("div");
+  d.className = "msg " + who;
+  d.innerHTML = text + (src ? `<div class="src ${src}">parsed by: ${src}</div>` : "");
+  log.appendChild(d); log.scrollTop = log.scrollHeight;
+}
+
+async function send(text) {
+  text = (text || document.getElementById("input").value).trim();
+  if (!text) return;
+  document.getElementById("input").value = "";
+  addMsg(text, "user");
+  const r = await fetch(API + "/api/chat", {
+    method: "POST", headers: {"Content-Type":"application/json"},
+    body: JSON.stringify({message: text})
+  });
+  const resp = await r.json();
+  addMsg(resp.text, "bot", resp.parse_source);
+  if (resp.diff) {
+    DIFF = resp.diff;
+    await getState();        // refresh to pull candidate into STATE
+    renderCompare();
+  } else if (resp.candidate === null && resp.intent !== "what_if") {
+    // non-plan answer; leave board as is
+  }
+}
+
+async function accept() {
+  await fetch(API + "/api/accept", {method:"POST"});
+  DIFF = null; document.getElementById("compare").innerHTML = "";
+  await getState(); addMsg("Plan updated.", "bot");
+}
+async function discard() {
+  await fetch(API + "/api/discard", {method:"POST"});
+  DIFF = null; document.getElementById("compare").innerHTML = "";
+  await getState();
+}
+
+const HINTS = [
+  "What are the prerequisites for Machine Learning?",
+  "Can I take Operating Systems now?",
+  "Why can't I take the capstone?",
+  "What should I take next term?",
+  "Delay Operating Systems",
+];
+function renderHints() {
+  const h = document.getElementById("hints");
+  h.innerHTML = `<div class="lane-label" style="margin-bottom:4px">Try</div>` +
+    HINTS.map(t => `<button onclick="send('${t.replace(/'/g,"\\'")}')">› ${t}</button>`).join("");
+}
+
+document.getElementById("send").onclick = () => send();
+document.getElementById("input").addEventListener("keydown", e => { if (e.key==="Enter") send(); });
+renderHints();
+getState();
+</script>
+</body>
+</html>
