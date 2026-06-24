@@ -1,0 +1,20 @@
+# Copy to .env and fill in. Selects which LLM backend llm_client.py talks to.
+
+# Which backend: "anthropic" (Claude API, default) or "lmstudio" (local).
+LLM_PROVIDER=anthropic
+
+# --- Anthropic (Claude) -----------------------------------------------------
+# Required when LLM_PROVIDER=anthropic. Get a key at https://console.anthropic.com
+ANTHROPIC_API_KEY=
+# Model to use. The project currently runs on Haiku.
+ANTHROPIC_MODEL=claude-haiku-4-5
+
+# --- LM Studio (local, OpenAI-compatible) -----------------------------------
+# Only used when LLM_PROVIDER=lmstudio.
+LMSTUDIO_BASE_URL=http://localhost:1234/v1
+LMSTUDIO_MODEL=local-model
+LMSTUDIO_TIMEOUT=30
+LMSTUDIO_CONNECT_TIMEOUT=2
+
+# Seconds to cache the backend's online/offline status.
+LLM_AVAIL_TTL=10
